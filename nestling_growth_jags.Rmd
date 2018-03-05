@@ -1,0 +1,400 @@
+---
+title: "nestling growth (JAGS predictions)"
+author: "DLN"
+date: "March 4, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+JAGS code of a nestling growth model with 1 covariates.
+The code also provides the predictions that are used in the figures.
+
+#libraries needed
+```{r}
+library(jagsUI)
+library(ggplot2)
+```
+
+#functions
+```{r}
+# Define function to renumber factor levels, so that they have no gaps in numbering
+renum <- function(old){ 
+  new <- numeric()
+  intermediate <- matrix(c(sort(unique(old)), seq(1,length(unique(old)))), ncol=2)
+  for (i in 1:length(old)){
+    new[i] <- intermediate[which(intermediate[,1]==old[i]),2]}
+  return(new)
+}
+
+date<-Sys.Date()
+```
+
+##data
+```{r}
+setwd("C:/Users/dnarango/Documents/Manuscripts/chickadee provisioning/analyses/nestling growth")
+
+nestlings<-read.csv("C:/Users/MTHALLWORTH/Documents/DESIREE/chickadee provisioning/nestlinggrowth_allyears_2march2018.csv",
+                    na.strings=".") %>%
+  filter(species=="cach")
+
+#plants<-read.csv("C:/Users/dnarango/Desktop/veg_test/results/origin_importancevalues_NN_results_2018-01-27#_format.csv")
+
+plants<-read.csv("C:/Users/MTHALLWORTH/Documents/DESIREE/chickadee provisioning/origin_importancevalues_NN_results_2018-01-27_format.csv")
+
+
+
+## fix some minor things
+nestlings[which(nestlings$band_number=="2710-25980", arr.ind = TRUE),c(17)]<-7.50
+
+
+## format data
+early<-nestlings %>%select(site, nest, band_number, year, date_early, broodsize_early,age_day, mass:wing) %>%
+  rename(caldate=date_early, broodsize=broodsize_early) %>%
+  mutate(measurement_type="early")
+late<-nestlings%>%select(site, nest, band_number, year, date_late, broodsize_late, age_late, mass_late:wing_late) %>%
+      rename(caldate=date_late, broodsize=broodsize_late,age_day=age_late,mass=mass_late, wing=wing_late, tarsus=tarsus_late, 
+             primary_pin=primary_pin_late, primary_exposed=primary_exposed_late,
+             rectrix_pin=rectrix_pin_late, rectrix_exposed=rectrix_exposed_late) %>%
+  mutate(measurement_type="late")
+
+early_late_format<-rbind(early,late)%>%
+  filter(age_day!="NA") %>%
+  gather(measurement, value, 8:14) %>%
+  mutate(age=round(age_day)) %>%
+  #filter(age<15 & age>2) %>%
+  left_join(plants, by="site") %>%
+  mutate(site_type=ifelse(proportion_exotic<0.5,"native","exotic")) %>%
+  filter(site_type!="NA")
+
+
+tarsus_growth<-early_late_format %>%
+  filter(measurement=="tarsus") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize,proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+
+
+
+wing_growth<-early_late_format %>%
+  filter(measurement=="wing") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize,proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+
+
+primary_growth<-early_late_format %>%
+  filter(measurement=="primary_exposed") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize,proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+
+
+mass_growth<-early_late_format %>%
+  filter(measurement=="mass") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize, proportion_exotic, proportion_exotic, proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+```
+
+#Models
+
+##Tarsus Model
+The best model has a random effect on xmid for both  nest and nestling with no covariance
+```{r BUGS code}
+sink("model-pred.jags")
+cat("
+    model {
+    
+    # Priors and constraints
+    Asym.int ~ dunif(0, 200)
+    xmid.int ~ dunif(0, 50)
+    K.int ~ dnorm(0, 0.001)
+
+    tau <- pow(sigma, -2)
+    sigma ~ dunif(0, 10)
+    sigma2 <- pow(sigma, 2)
+    tau.Asym.nest <- pow(sigma.Asym.nest, -2)
+    sigma.Asym.nest ~ dunif(0, 10)
+    sigma2.Asym.nest <- pow(sigma.Asym.nest, 2)
+    tau.xmid.nest <- pow(sigma.xmid.nest, -2)
+    sigma.xmid.nest ~ dunif(0, 10)
+    sigma2.xmid.nest <- pow(sigma.xmid.nest, 2)
+    
+
+    Asym.beta ~ dnorm(0, 0.001)
+    xmid.beta ~ dnorm(0, 0.001)
+    K.beta ~ dnorm(0, 0.001)
+ 
+    
+    
+    # Likelihood 
+    for (i in 1:n){
+    mu[i] <- Asym[i] / (1 + exp((xmid[i] - Age[i]) * K[i]))
+    y[i] ~ dnorm(mu[i], tau)
+    Asym[i] <- Asym.int + Asym.beta[1] * cov1[i] + a.2[nest_id[i]]
+    xmid[i] <- xmid.int + xmid.beta[1] * cov1[i]  + b.2[nest_id[i]]
+    K[i] <- K.int + K.beta[1] * cov1[i] 
+    }
+    
+    
+    for (j in 1:n_nest){
+    a.2[j] ~ dnorm(0, tau.Asym.nest)     # Nest random effect for asymptote
+    b.2[j] ~ dnorm(0, tau.xmid.nest)     # Nest random effect for inflation point
+    }
+    
+    # Prediction (predicted trait for each day)
+    for (i in 1:20){
+    for (s in 1:100){
+    eps.Asym.nest[i,s] ~ dnorm(0, tau.Asym.nest)
+    eps.xmid.nest[i,s] ~ dnorm(0, tau.xmid.nest)
+    
+    mu.pred[i,s] <- (Asym.int + Asym.beta[1] * pre1[s]  + eps.Asym.nest[i,s]) / 
+(1 + exp(((xmid.int + xmid.beta[1] * pre1[s]  + eps.xmid.nest[i,s])- i) * 
+(K.int + K.beta[1] * pre1[s])))
+    y.pred[i,s] ~ dnorm(mu.pred[i,s], tau)
+    } # s
+    } # i
+    }
+    ",fill = TRUE)
+sink()
+```
+##Setting up the model
+```{r}
+
+# Bundle data to be used in JAGS
+jags.data <- list(y = tarsus_growth$value, 
+                  Age = tarsus_growth$Age, 
+                  n = length(tarsus_growth$value), 
+                  cov1 = tarsus_growth$proportion_exotic, 
+                  nest_id = renum(as.numeric(tarsus_growth$nest)), 
+                  n_nest = max(renum(as.numeric(tarsus_growth$nest))), 
+                  nestling_id = renum(as.numeric(tarsus_growth$band_number)), 
+                  n_nestling = max(renum(as.numeric(tarsus_growth$band_number))), 
+                  pre1 = seq(from=0,to=1, by=0.01))
+
+# MCMC settings
+ni <- 50000; nt <- 10; nb <- 10000; nc <- 3
+
+# Initial values
+inits <- function(){list(Asym.int = runif(1, 16, 18), xmid.int = 8, K.int = 0.5)} 
+
+# Parameters monitored
+parameters <- c("Asym.int", "xmid.int", "K.int", "Asym.beta", "xmid.beta", 
+                "K.beta", "sigma2", "sigma2.Asym.nest", 
+                "sigma2.xmid.nest",  "sigma2.K.nest", 
+                 "y.pred", "y.predO")
+
+# Call JAGS from R
+M1 <- jags(jags.data, inits, 
+           parameters, 
+           "model-pred.jags", 
+           n.chains = nc, 
+           n.thin = nt, 
+           n.iter = ni, 
+           n.burnin = nb, 
+           seed=42,
+           parallel = TRUE)
+
+print(M1)
+
+saveRDS(M1,paste0("TARSUS_jags_output_seed42",date,".csv"))
+```
+## Graphing
+```{r tarsus graph}
+
+mu.pred<-M1$sims.list$y.pred
+
+mean.pred=matrix(nrow=100, ncol=20)
+
+for (i in 1:100){
+  for (d in 1:20){
+  mean.pred[i,d]<-mean(mu.pred[,d,i])
+  }
+}
+
+mean.pred_graph<-data.frame(mean.pred) %>%
+  mutate(nonnative=c(1:100)) %>%
+  gather(day, value, X1:X20) %>%
+  mutate(age=ifelse(day=="X1",1,ifelse(day=="X2",2,ifelse(day=="X3",3,
+                                ifelse(day=="X4",4,ifelse(day=="X5",5,ifelse(day=="X6",6,
+                                ifelse(day=="X7",7,ifelse(day=="X8",8, ifelse(day=="X9",9,
+                                ifelse(day=="X10",10,ifelse(day=="X11",11,ifelse(day=="X12",12,
+                                ifelse(day=="X13",13,ifelse(day=="X14",14,ifelse(day=="X15",15,
+                                ifelse(day=="X16",16,ifelse(day=="X17",17,ifelse(day=="X18",18,
+                                ifelse(day=="X19",19,20))))))))))))))))))))%>%
+  filter(nonnative%in%c(0,10,20,30,40,50,60,70,80,90,100))
+
+
+mean.pred_graph$nonnative2=as.factor(mean.pred_graph$nonnative)
+
+
+ggplot(data=mean.pred_graph, aes(x=age,y=value,group=nonnative2))+
+  geom_smooth(aes(color=nonnative2), se=FALSE)+
+  scale_colour_brewer(palette ="PiYG", direction=-1)
+```
+#Mass
+```{r}
+
+# Bundle data to be used in JAGS
+jags.data <- list(y = mass_growth$value, 
+                  Age = mass_growth$Age, 
+                  n = length(mass_growth$value), 
+                  cov1 = mass_growth$proportion_exotic, 
+                  nest_id = renum(as.numeric(mass_growth$nest)), 
+                  n_nest = max(renum(as.numeric(mass_growth$nest))), 
+                  nestling_id = renum(as.numeric(mass_growth$band_number)), 
+                  n_nestling = max(renum(as.numeric(mass_growth$band_number))), 
+                  pre1 = seq(from=0,to=1, by=0.01))
+
+# MCMC settings
+ni <- 50000; nt <- 10; nb <- 10000; nc <- 3
+
+# Initial values
+inits <- function(){list(Asym.int = runif(1, 12, 14), xmid.int = 8, K.int = 0.5)} 
+
+# Parameters monitored
+parameters <- c("Asym.int", "xmid.int", "K.int", "Asym.beta", "xmid.beta", 
+                "K.beta", "sigma2", "sigma2.Asym.nest", 
+                "sigma2.xmid.nest",  "sigma2.K.nest", 
+                 "y.pred", "y.predO")
+
+# Call JAGS from R
+M1 <- jags(jags.data, inits, 
+           parameters, 
+           "model-pred.jags", 
+           n.chains = nc, 
+           n.thin = nt, 
+           n.iter = ni, 
+           n.burnin = nb, 
+           seed=42,
+           parallel = TRUE)
+
+print(M1)
+
+saveRDS(M1,paste0("MASS_jags_output_seed42",date,".csv"))
+```
+
+## Graphing
+```{r mass graph}
+
+mu.pred<-M1$sims.list$y.pred
+
+mean.pred=matrix(nrow=100, ncol=20)
+
+for (i in 1:100){
+  for (d in 1:20){
+  mean.pred[i,d]<-mean(mu.pred[,d,i])
+  }
+}
+
+mean.pred_graph<-data.frame(mean.pred) %>%
+  mutate(nonnative=c(1:100)) %>%
+  gather(day, value, X1:X20) %>%
+  mutate(age=ifelse(day=="X1",1,ifelse(day=="X2",2,ifelse(day=="X3",3,
+                                ifelse(day=="X4",4,ifelse(day=="X5",5,ifelse(day=="X6",6,
+                                ifelse(day=="X7",7,ifelse(day=="X8",8, ifelse(day=="X9",9,
+                                ifelse(day=="X10",10,ifelse(day=="X11",11,ifelse(day=="X12",12,
+                                ifelse(day=="X13",13,ifelse(day=="X14",14,ifelse(day=="X15",15,
+                                ifelse(day=="X16",16,ifelse(day=="X17",17,ifelse(day=="X18",18,
+                                ifelse(day=="X19",19,20))))))))))))))))))))%>%
+  filter(nonnative%in%c(0,10,20,30,40,50,60,70,80,90,100))
+
+
+mean.pred_graph$nonnative2=as.factor(mean.pred_graph$nonnative)
+
+
+ggplot(data=mean.pred_graph, aes(x=age,y=value,group=nonnative2))+
+  geom_smooth(aes(color=nonnative2), se=FALSE)+
+  scale_colour_brewer(palette ="PiYG", direction=-1)
+```
+#Wing
+NOT WORKING
+```{r}
+
+# Bundle data to be used in JAGS
+jags.data <- list(r = wing_growth$value, 
+                  Age = wing_growth$Age, 
+                  n = length(wing_growth$value), 
+                  cov1 = wing_growth$proportion_exotic, 
+                  nest_id = renum(as.numeric(wing_growth$nest)), 
+                  n_nest = max(renum(as.numeric(wing_growth$nest))), 
+                  nestling_id = renum(as.numeric(wing_growth$band_number)), 
+                  n_nestling = max(renum(as.numeric(wing_growth$band_number))), 
+                  pre1 = seq(from=0,to=1, by=0.01))
+
+# MCMC settings
+ni <- 5000; nt <- 10; nb <- 1000; nc <- 3
+
+# Initial values
+inits <- function(){list(Asym.int = runif(1, 47, 49), xmid.int = 8, K.int = 0.5)} 
+
+# Parameters monitored
+parameters <- c("Asym.int", "xmid.int", "K.int", "Asym.beta", "xmid.beta", 
+                "K.beta", "sigma2", "sigma2.Asym.nest", 
+                "sigma2.xmid.nest",  "sigma2.K.nest", 
+                 "y.pred", "y.predO")
+
+# Call JAGS from R
+M1 <- jags(jags.data, inits, 
+           parameters, 
+           "model-pred.jags", 
+           n.chains = nc, 
+           n.thin = nt, 
+           n.iter = ni, 
+           n.burnin = nb, 
+           seed=42,
+           parallel = TRUE)
+
+print(M1)
+
+saveRDS(M1,paste0("WING_jags_output_seed42",date,".csv"))
+```
+primary
+```{r}
+
+# Bundle data to be used in JAGS
+jags.data <- list(r = primary_growth$value, 
+                  Age = primary_growth$Age, 
+                  n = length(primary_growth$value), 
+                  cov1 = primary_growth$proportion_exotic, 
+                  nest_id = renum(as.numeric(primary_growth$nest)), 
+                  n_nest = max(renum(as.numeric(primary_growth$nest))), 
+                  nestling_id = renum(as.numeric(primary_growth$band_number)), 
+                  n_nestling = max(renum(as.numeric(primary_growth$band_number))), 
+                  pre1 = seq(from=0,to=1, by=0.01))
+
+# MCMC settings
+ni <- 5000; nt <- 10; nb <- 1000; nc <- 3
+
+# Initial values
+inits <- function(){list(Asym.int = runif(1, 14, 16), xmid.int = 8, K.int = 0.5)} 
+
+# Parameters monitored
+parameters <- c("Asym.int", "xmid.int", "K.int", "Asym.beta", "xmid.beta", 
+                "K.beta", "sigma2", "sigma2.Asym.nest", 
+                "sigma2.xmid.nest",  "sigma2.K.nest", 
+                 "y.pred", "y.predO")
+
+# Call JAGS from R
+M1 <- jags(jags.data, inits, 
+           parameters, 
+           "model-pred.jags", 
+           n.chains = nc, 
+           n.thin = nt, 
+           n.iter = ni, 
+           n.burnin = nb, 
+           seed=42,
+           parallel = TRUE)
+
+print(M1)
+```

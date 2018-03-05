@@ -1,0 +1,605 @@
+---
+title: "nestling growth"
+author: "Desiree Narango"
+date: "February 26, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(tidyr)
+library(nlme)
+library(ggplot2)
+library(AICcmodavg)
+```
+
+#Chickadee data
+# Using the methods from Sofaer  et al 2013
+
+## To Do:
+## What about including date as an effect? I wonder if I'm not seeing an effect because I'm not including that...
+## The random effect of nest should take care of nest level effects like clutch size
+
+```{r import data}
+
+nestlings<-read.csv("C:/Users/dnarango/Documents/FINAL DATA/nestlinggrowth_allyears_2march2018.csv",
+                    na.strings=".") %>%
+  filter(species=="cach")
+
+plants<-read.csv("C:/Users/dnarango/Desktop/veg_test/results/origin_importancevalues_NN_results_2018-01-27_format.csv")
+
+
+
+## fix some minor things
+nestlings[which(nestlings$band_number=="2710-25980", arr.ind = TRUE),c(17)]<-7.50
+
+
+## format data
+early<-nestlings %>%select(site, nest, band_number, year, date_early, broodsize_early,age_day, mass:wing) %>%
+  rename(caldate=date_early, broodsize=broodsize_early) %>%
+  mutate(measurement_type="early")
+late<-nestlings%>%select(site, nest, band_number, year, date_late, broodsize_late, age_late, mass_late:wing_late) %>%
+      rename(caldate=date_late, broodsize=broodsize_late,age_day=age_late,mass=mass_late, wing=wing_late, tarsus=tarsus_late, 
+             primary_pin=primary_pin_late, primary_exposed=primary_exposed_late,
+             rectrix_pin=rectrix_pin_late, rectrix_exposed=rectrix_exposed_late) %>%
+  mutate(measurement_type="late")
+
+early_late_format<-rbind(early,late)%>%
+  filter(age_day!="NA") %>%
+  gather(measurement, value, 8:14) %>%
+  mutate(age=round(age_day)) %>%
+  #filter(age<15 & age>2) %>%
+  left_join(plants, by="site") %>%
+  mutate(site_type=ifelse(proportion_exotic<0.5,"native","exotic")) %>%
+  filter(site_type!="NA")
+
+
+tarsus_growth<-early_late_format %>%
+  filter(measurement=="tarsus") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize,proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+
+
+
+wing_growth<-early_late_format %>%
+  filter(measurement=="wing") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize,proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+
+
+primary_growth<-early_late_format %>%
+  filter(measurement=="primary_exposed") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize,proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+
+
+mass_growth<-early_late_format %>%
+  filter(measurement=="mass") %>%
+  select(site_type,site,nest,age_day,caldate,band_number,measurement,value,broodsize, proportion_exotic, proportion_exotic, proportion_exotic) %>%
+  filter(value!="NA")%>%
+  rename(site_name=site) %>%
+  mutate(site=ifelse(site_type=="native",1,0)) %>%
+  rename(Age=age_day)
+```
+## Functions needs to run the nlme model
+```{r}
+## Model with no covariates
+Cov0 = function(Age, Asym.int, xmid.int, K.int){
+   (Asym.int)/(1 + exp(((xmid.int) - Age)*(K.int)))
+}
+
+## Derivatives (0 covariates)
+DerivCov0 = deriv(body(Cov0)[[2]], namevec = c("Asym.int", "xmid.int", "K.int"), function.arg = Cov0)
+
+
+##Model with 1 covariate
+Cov1 = function(Age, Asym.int, Asym.beta1, xmid.int, xmid.beta1, K.int, K.beta1, covariable1){
+   (Asym.int + Asym.beta1*covariable1)/(1 + exp(((xmid.int+xmid.beta1*covariable1) - Age)*(K.int+K.beta1*covariable1)))
+}
+
+## Derivatives (1 covariate)
+DerivCov1 = deriv(body(Cov1)[[2]], namevec = c("Asym.int", "Asym.beta1", "xmid.int", "xmid.beta1", "K.int", "K.beta1"), function.arg = Cov1)
+
+```
+
+
+## First need to determine what model best fits the data
+## steps: 
+## 1. Use AIC to find best model with different random effects
+## 2. Use JAGS to make predictions
+```{r}
+##tarsus
+# Starting values:
+startCov1 = c(Asym.int = 19, Asym.beta1 = 0, xmid.int = 8, xmid.beta1 = 0,  K.int = .35, K.beta1 = 0)
+startCov0 = c(Asym.int = 19, xmid.int = 8, K.int = .5)
+
+
+### Intercept model
+
+## No random effects
+m0 = gnls(value~ Asym.int/(1 + exp((xmid.int - Age)*K.int)), data = tarsus_growth, start = startCov0)
+summary(m0)
+
+
+Cand.models <- list( )
+## one random effect (nest)
+m1 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = K ~ 1 | nest, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m2 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym ~ 1 | nest, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m3 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = xmid ~ 1 | nest, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+#1 random effect (band number)
+m4 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = xmid ~ 1 | band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m5 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = K ~ 1 | band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m6 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym ~ 1 | band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+#2 random effect (nest, band number)
+m7 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym ~ 1 | nest/band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m8 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = K ~ 1 | nest/band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m9 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = xmid ~ 1 | nest/band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+## random effect on multiple parameters
+m9 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym+ xmid ~ 1 | nest/band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m10 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym+ K ~ 1 | nest/band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m11 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = xmid+ K ~ 1 | nest/band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m12 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym+ xmid ~ 1 | nest, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m13 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym+ K ~ 1 | nest, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m14 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = xmid+ K ~ 1 | nest, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m15 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym+ xmid ~ 1 | band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m16 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = Asym+ K ~ 1 | band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m17 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = xmid+ K ~ 1 | band_number, 
+                                    data =tarsus_growth, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+tarsus_GroupedNestNestling = groupedData(value ~ Age | nest/band_number, data =
+tarsus_growth)
+
+## correlation at band number level but not nest
+m18 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = list(nest=
+                                pdDiag(Asym + xmid+K ~ 1), band_number = pdSymm(Asym + xmid +K~ 1)), 
+                                    data =tarsus_GroupedNestNestling, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+m19 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = list(nest=
+pdDiag(Asym + xmid +K ~ 1), band_number = pdDiag(Asym + xmid + K ~ 1)), 
+                                    data =tarsus_GroupedNestNestling, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m20 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = list(nest=
+pdDiag(Asym + xmid ~ 1), band_number = pdDiag(Asym + xmid + K ~ 1)), 
+                                    data =tarsus_GroupedNestNestling, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+m21 =  nlme(value ~ SiteNATIVEDeriv(Age, proportion_exotic,Asym, xmid, K, 
+                                   Kdiff, middiff, Adiff), 
+                                    fixed = Asym + xmid + K +
+                                    Kdiff + middiff + Adiff ~ 1, 
+                                    random = list(nest=
+pdDiag(Asym + xmid ~ 1), band_number = pdSymm(Asym + xmid + K ~ 1)), 
+                                    data =tarsus_GroupedNestNestling, 
+                                    start = startsiteNATIVE,control=list(tolerance=100))
+
+Cand.models <- list("m1" = m1,
+	"m2" = m2,
+		"m3" = m3,
+		"m4" = m4,
+		"m5" = m5,
+		"m6" = m6,
+		"m7" = m7,
+		"m8" = m8,
+		"m9" = m9,
+		"m10" = m10,
+		"m11" = m11,
+		"m12" = m12,
+		"m13" = m13,
+  	"m14" = m14,
+		"m15" = m15,
+		"m16" = m16,
+		"m17" = m17,
+		"m18" = m18,
+		"m19" = m19,
+	  "m20" = m20,
+		"m21" = m21)
+
+library(AICcmodavg)
+Modnames <- paste("mod", 1:length(Cand.models), sep = " ")
+AIC<-aictab(cand.set = Cand.models, sort = TRUE, second.ord=TRUE)
+
+AIC
+
+```
+
+
+
+```{r}
+nlme(value ~ DerivCov1(Age, Asym.int, Asym.beta1, xmid.int, xmid.beta1, K.int, K.beta1, covariable1 = proportion_exotic), 
+                  fixed = Asym.int + xmid.int + K.int + K.beta1 + xmid.beta1 + Asym.beta1 ~ 1, 
+          random = K.int ~ 1 | nest/band_number, 
+          data = tarsus_growth, 
+          start = startCov1,
+          control=list(tolerance=100))
+summary(m1)
+### Covariance amoung random effects
+m1 = nlme(value ~ DerivCov1(Age, proportion_exotic,Asym.int, xmid.int, K.int), data = tarsus_growth, fixed = Asym.int + xmid.int + K.int ~ 1, random = list(nest =pdDiag(Asym.int + xmid.int + K.int ~ 1), band_number = pdDiag(Asym.int + xmid.int + K.int ~ 1)), start = startCov1)
+summary(m1)
+
+
+OnePop_NoRE_gnls = gnls(value ~ SiteNATIVEDeriv(Age, proportion_exotic,
+                           Asym, xmid, K, Kdiff, middiff, Adiff), 
+                        fixed = Asym + xmid + K + Kdiff + middiff + Adiff ~ 1, 
+                        data = tarsus_growth, 
+                        start = startsiteNATIVE)
+summary(SiteNATIVE_Ai_NestNestling)
+
+# Example syntax for models with one random effect (either Nest or Nestling) on one parameter
+# Model with nest-level random effect on the asymptotic mass
+OnePop_A_Nest = nlme(weight_g ~ DerivOnePop(Age, Asym, xmid, K), data = AKgrowth, fixed = Asym + xmid + K ~ 1, random = Asym ~ 1 | Nest_ID, start = startOnePop)
+summary(OnePop_A_Nest)
+
+# Model with nestling-level random effect on the inflection point
+OnePop_i_Nestling = nlme(weight_g ~ DerivOnePop(Age, Asym, xmid, K), data = AKgrowth,
+fixed = Asym + xmid + K ~ 1, random = xmid ~ 1 | Nestling_ID, start = startOnePop)
+summary(OnePop_i_Nestling)
+
+# Example syntax for models with both levels of random effects (Nest and Nestling) on a single parameter. Note that Nestling_ID is nested within Nest_ID.
+# Model with nest- and nestling-level random effects on the inflection point
+OnePop_i_NestNestling = nlme(weight_g ~ DerivOnePop(Age, Asym, xmid, K), data =
+AKgrowth, fixed = Asym + xmid + K ~ 1, random = xmid ~ 1 | Nest_ID/Nestling_ID, start =
+startOnePop)
+summary(OnePop_i_NestNestling)
+
+# Example syntax for models with one level of random effect on multiple parameters. By default, nlme allows for covariance between parameters.
+# Model with nestling-level random effects on the asymptotic mass and the inflection point
+OnePop_Ai_Nestling = nlme(weight_g ~ DerivOnePop(Age, Asym, xmid, K), data =
+AKgrowth, fixed = Asym + xmid + K ~ 1, random = Asym + xmid ~ 1 | Nestling_ID, start =
+startOnePop)
+summary(OnePop_Ai_Nestling)
+
+# Example syntax for models with both levels of random effects on multiple parameters.
+# Model with nest- and nestling-level random effects on the asymptotic mass and the inflection point
+OnePop_Ai_NestNestling = nlme(weight_g ~ DerivOnePop(Age, Asym, xmid, K), data =
+AKgrowth, fixed = Asym + xmid + K ~ 1, random = Asym + xmid ~ 1 | Nest_ID/Nestling_ID,
+start = startOnePop)
+summary(OnePop_Ai_NestNestling)
+
+
+```
+
+###### Example syntax for producing diagnostic plots #######
+```{r}
+# "." references the fitted object
+# Example code based on top AK model:
+plot(AK_AiNestNestling_noCovBoth) # plot residuals vs. fitted values
+plot(AK_AiNestNestling_noCovBoth, resid(., type = "p") ~ fitted(.) | Younger_1ifknown) #residuals vs. fitted by group - use to compare residuals of older/younger birds, populations
+
+# observed vs. fitted values
+plot(AK_AiNestNestling_noCovBoth, weight_g ~ fitted(.))
+plot(AK_AiNestNestling_noCovBoth, weight_g ~ fitted(.) | Nest_ID) # separately by nest
+
+# normal plots of residuals
+qqnorm(AK_AiNestNestling_noCovBoth, ~ resid(., type = "p"))
+qqnorm(AK_AiNestNestling_noCovBoth, ~ resid(., type = "p") | Younger_1ifknown)
+
+# Check assumption that random effects are normally distributed
+ranef(AK_AiNestNestling_noCovBoth, level = "Nest_ID") # this is how to access the 'BLUPs'
+qqnorm(AK_AiNestNestling_noCovBoth, ~ ranef(., level = "Nest_ID"))
+qqnorm(AK_AiNestNestling_noCovBoth, ~ ranef(., level = "Nestling_ID"))
+
+# residuals by group (i.e. by nest):
+plot(AK_AiNestNestling_noCovBoth, Nest_ID ~ resid(., type = "p"), abline = 0)
+```
+
+###############################################################
+# Comparison of growth trajectories between two populations
+###############################################################
+```{r}
+# Goal is to test for differences in the three logistic growth parameters between two populations.
+# Model included a fixed runt effect on the inflection point that does not differ between populations (called runt)
+
+# Function including differences between populations and a runt effect on the inflection point
+SiteNATIVE_function = function(Age, site,  Asym, xmid, K, Kdiff, middiff, Adiff){
+(Asym + Adiff*site)/(1 + exp(((xmid+middiff*site) -
+Age)*(K+Kdiff*site)))
+}
+
+# Calculate derivatives:
+SiteNATIVEDeriv = deriv(body(SiteNATIVE_function)[[2]], namevec = c("Asym", "xmid", "K",
+"Kdiff", "middiff", "Adiff"), function.arg= SiteNATIVE_function)
+
+# Starting values:
+startsiteNATIVE = c(Asym = 17, xmid = 8, K = 0.5, Kdiff=0, middiff=0, Adiff = 0)
+
+
+# Syntax for running models mirrors syntax shown above, with updated fixed-effect function
+# Top-ranked model: Random effects of nest and nestling on the asymptotic mass and the inflection point
+SiteNATIVE_Ai_NestNestling = nlme(value ~ SiteNATIVEDeriv(Age, site,
+ Asym, xmid, K, Kdiff, middiff, Adiff), fixed = Asym + xmid + K +
+Kdiff + middiff + Adiff  ~ 1, random = xmid ~ 1 | nest/band_number, data =
+tarsus_growth, start = startsiteNATIVE,control=list(tolerance=100))
+summary(SiteNATIVE_Ai_NestNestling)
+
+### No difference in tarsus growth
+
+
+
+### graph
+newdata=expand.grid(Age=c(1:16), site=c(1,0), nest=mass_growth$nest, 
+                    band_number=tarsus_growth$band_number)
+
+newdata$predictions<-predict(SiteNATIVE_Ai_NestNestling,newdata=newdata)
+
+newdata$site<-as.factor(newdata$site)
+
+newdata<-filter(newdata, predictions!="NA")
+
+
+site_color=c("1"="gray20","0"="gray60")
+
+ggplot(data=newdata, aes(x=Age, y=predictions, group=site)) +
+  #geom_jitter(aes(color=site), size=0.5, alpha=0.1)+
+  labs(x="Nestling Age", y="Predicted Tarsus length (in mm)", group="Site Type")+
+  geom_smooth(aes(color=site), se=TRUE) + 
+  scale_color_manual(values=site_color,labels=c("Nonnative","Native"))+
+  theme_bestgraph
+
+```
+## mass comparison
+```{r comparing mass growth}
+# Starting values:
+startsiteNATIVE = c(Asym = 13, xmid = 8, K = 0.5, Kdiff=0, middiff=0, Adiff = 0)
+
+
+# Syntax for running models mirrors syntax shown above, with updated fixed-effect function
+# Top-ranked model: Random effects of nest and nestling on the asymptotic mass and the inflection point
+SiteNATIVE_Ai_NestNestling = nlme(value ~ SiteNATIVEDeriv(Age, site,
+ Asym, xmid, K, Kdiff, middiff, Adiff), fixed = Asym + xmid + K +
+Kdiff + middiff + Adiff  ~ 1, random = xmid ~ 1 | nest/band_number, data =
+mass_growth, start = startsiteNATIVE,control=list(tolerance=100))
+summary(SiteNATIVE_Ai_NestNestling)
+
+### for mass, there is a signifigant difference in K (growth)
+### In other words, how quickly they grow
+### native grow faster
+
+## also signifgant difference in A
+## in other words, there  is a difference in peak
+## native peak at lower weights
+
+
+### graph
+newdata=expand.grid(Age=c(1:16), site=c(1,0), nest=mass_growth$nest, 
+                    band_number=mass_growth$band_number)
+
+newdata$predictions<-predict(SiteNATIVE_Ai_NestNestling,newdata=newdata)
+
+newdata$site<-as.factor(newdata$site)
+
+newdata<-filter(newdata, predictions!="NA")
+
+
+site_color=c("1"="gray20","0"="gray60")
+
+ggplot(data=newdata, aes(x=Age, y=predictions, group=site)) +
+  #geom_jitter(aes(color=site), size=0.5, alpha=0.1)+
+  labs(x="Nestling Age", y="Predicted Mass (in g)", group="Site Type")+
+  geom_smooth(aes(color=site), se=TRUE) + 
+  scale_color_manual(values=site_color,labels=c("Nonnative","Native"))+
+  theme_bestgraph
+  
+
+```
+
+```{r comparing wing}
+# Starting values:
+startsiteNATIVE = c(Asym = 50, xmid = 8, K = 0.5, Kdiff=0, middiff=0, Adiff = 0)
+
+
+# Syntax for running models mirrors syntax shown above, with updated fixed-effect function
+# Top-ranked model: Random effects of nest and nestling on the asymptotic mass and the inflection point
+SiteNATIVE_Ai_NestNestling = nlme(value ~ SiteNATIVEDeriv(Age, site,
+ Asym, xmid, K, Kdiff, middiff, Adiff), fixed = Asym + xmid + K +
+Kdiff + middiff + Adiff  ~ 1, random = xmid ~ 1 | nest/band_number, data =
+wing_growth, start = startsiteNATIVE,control=list(tolerance=100))
+summary(SiteNATIVE_Ai_NestNestling)
+
+### for wing there is no difference
+
+
+### graph
+newdata=expand.grid(Age=c(1:20), site=c(1,0), nest=mass_growth$nest, 
+                    band_number=wing_growth$band_number)
+
+newdata$predictions<-predict(SiteNATIVE_Ai_NestNestling,newdata=newdata)
+
+newdata$site<-as.factor(newdata$site)
+
+newdata<-filter(newdata, predictions!="NA")
+
+
+site_color=c("1"="gray20","0"="gray60")
+
+ggplot(data=newdata, aes(x=Age, y=predictions, group=site)) +
+  #geom_jitter(aes(color=site), size=0.5, alpha=0.1)+
+  labs(x="Nestling Age", y="Predicted Wing (in mm)", group="Site Type")+
+  geom_smooth(aes(color=site), se=TRUE) + 
+  scale_color_manual(values=site_color,labels=c("Nonnative","Native"))+
+  theme_bestgraph
+```
+## primary
+```{r comparing wing}
+# Starting values
+primary_growth2<-filter(primary_growth, band_number!="eisesho_unb_1")
+
+
+startsiteNATIVE = c(Asym = 15, xmid = 8, K = 0.5, Kdiff=0, middiff=0, Adiff = 0)
+
+
+# Syntax for running models mirrors syntax shown above, with updated fixed-effect function
+# Top-ranked model: Random effects of nest and nestling on the asymptotic mass and the inflection point
+SiteNATIVE_Ai_NestNestling = nlme(value ~ SiteNATIVEDeriv(Age, site,
+ Asym, xmid, K, Kdiff, middiff, Adiff), fixed = Asym + xmid + K +
+Kdiff + middiff + Adiff  ~ 1, random = xmid ~ 1 | nest/band_number, data =
+primary_growth2, start = startsiteNATIVE,control=list(tolerance=100))
+summary(SiteNATIVE_Ai_NestNestling)
+
+
+
+
+### for wing there is no difference
+
+### No difference in primary growth
+
+### graph
+newdata=expand.grid(Age=c(1:16), site=c(1,0), nest=mass_growth$nest, 
+                    band_number=primary_growth$band_number)
+
+newdata$predictions<-predict(SiteNATIVE_Ai_NestNestling,newdata=newdata)
+
+newdata$site<-as.factor(newdata$site)
+
+newdata<-filter(newdata, predictions!="NA")
+
+
+site_color=c("1"="gray20","0"="gray60")
+
+ggplot(data=newdata, aes(x=Age, y=predictions, group=site)) +
+  #geom_jitter(aes(color=site), size=0.5, alpha=0.1)+
+  labs(x="Nestling Age", y="Predicted primary growth (in mm)", group="Site Type")+
+  geom_smooth(aes(color=site), se=TRUE) + 
+  scale_color_manual(values=site_color,labels=c("Nonnative","Native"))+
+  theme_bestgraph
+```
+
